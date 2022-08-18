@@ -1,5 +1,7 @@
 --[[
     AnisotropicKuwaharaFilter: 
+     - This file licensed under the GPL Version 3 license.
+     - https://github.com/AJpon/BMD_Fusion_Atoms/blob/main/LICENSE
 
     Anisotropic Kuwahara Filtering on the GPU (Paper)
      - https://www.kyprianidis.com/p/gpupro/
