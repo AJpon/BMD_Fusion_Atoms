@@ -1,0 +1,545 @@
+--[[
+    AnisotropicKuwaharaFilter: 
+
+    Anisotropic Kuwahara Filtering on the GPU (Paper)
+     - https://www.kyprianidis.com/p/gpupro/
+     - https://www.taylorfrancis.com/chapters/edit/10.1201/b10648-22/anisotropic-kuwahara-filtering-gpu
+
+    Original source code
+     - https://code.google.com/archive/p/gpuakf/
+     - https://code.google.com/archive/p/polyakf/
+
+    Version 0.10
+]]
+
+---@alias float number
+---@alias double number
+---@alias int number
+---@alias uint number
+
+FuRegisterClass("AnisotropicKuwahara", CT_Tool, {
+    REGS_Name = "Anisotropic Kuwahara Filter",
+    REGS_Category = "Filter",
+    REGS_OpIconString = "AKF",
+    REGS_OpDescription = "",
+    REG_Version = 010,
+})
+
+--These are the parameters that we need access to in our kernel.
+AkfParams = [[ 
+    int k0123Size;
+	float sigma;
+    float alpha;
+	float radius;
+	float q;
+    int width;
+    int height;
+	int srcCompOrder;
+]]
+
+--This is the GPU kernel, all of the image algorithms happen here.
+AkfKernel = [[
+
+//#define PI = 3.14159265358979323846;
+//#define PI M_PI
+__CONSTANT__ int N = 8;
+
+inline __HOST__ __DEVICE__ float3 float3_xyz(float4 v)
+{
+    return to_float3(v.x, v.y, v.z);
+}
+
+inline __HOST__ __DEVICE__ float4 _to_float4(float3 v, float w)
+{
+    return to_float4(v.x, v.y, v.z, w);
+}
+
+inline __HOST__ __DEVICE__ float4 texture2D(__TEXTURE2D__ in, float2 uv)
+{
+    //return _tex2DVecN(in, uv.x, uv.y, 15);
+    return _tex2DVec4(in, uv.x, uv.y);
+}
+
+inline __HOST__ __DEVICE__ float3 absF(float3 x)
+{
+    return to_float3(_fabs(x.x), _fabs(x.y),_fabs(x.z));
+}
+
+typedef struct
+{
+    float2 r0, r1;
+} mat2;
+
+inline __HOST__ __DEVICE__ mat2 make_mat2(float A, float B, float C, float D)
+{
+    mat2 E;
+    E.r0 = to_float2(A,B);
+    E.r1 = to_float2(C,D);
+    return E;
+}
+
+inline __HOST__ __DEVICE__ mat2 make_mat( float2 A, float2 B)  
+{  
+    mat2 C;  
+    C.r0 = A;  
+    C.r1 = B;  
+    return C;  
+}
+
+inline __HOST__ __DEVICE__ float2 operator*( mat2 B, float2 A) 
+{  
+    float2 C;  
+    C.x = A.x * B.r0.x + A.y * B.r0.y;  
+    C.y = A.x * B.r1.x + A.y * B.r1.y;  
+    return C;  
+}
+
+inline __HOST__ __DEVICE__ mat2 operator*( mat2 a, mat2 b) 
+{  
+    mat2 c;  
+    c.r0.x = a.r0.x * b.r0.x + a.r0.y * b.r1.x;
+    c.r0.y = a.r0.x * b.r0.y + a.r0.y * b.r1.y;
+    c.r1.x = a.r1.x * b.r0.x + a.r1.y * b.r1.x;
+    c.r1.y = a.r1.x * b.r0.y + a.r1.y * b.r1.y;
+    return c;  
+}
+
+__DEVICE__ float3 sst(float2 uv, __TEXTURE2D__ in) 
+{
+    float2 d = to_float2_s(1.0f);
+
+    float3 u = (
+        -1.0 * float3_xyz(texture2D(in, uv + to_float2(-d.x, -d.y))) +
+        -2.0 * float3_xyz(texture2D(in, uv + to_float2(-d.x,  0.0))) + 
+        -1.0 * float3_xyz(texture2D(in, uv + to_float2(-d.x,  d.y))) +
+        +1.0 * float3_xyz(texture2D(in, uv + to_float2( d.x, -d.y))) +
+        +2.0 * float3_xyz(texture2D(in, uv + to_float2( d.x,  0.0))) + 
+        +1.0 * float3_xyz(texture2D(in, uv + to_float2( d.x,  d.y)))
+        ) / 4.0;
+
+    float3 v = (
+        -1.0 * float3_xyz(texture2D(in, uv + to_float2(-d.x, -d.y))) + 
+        -2.0 * float3_xyz(texture2D(in, uv + to_float2( 0.0, -d.y))) + 
+        -1.0 * float3_xyz(texture2D(in, uv + to_float2( d.x, -d.y))) +
+        +1.0 * float3_xyz(texture2D(in, uv + to_float2(-d.x,  d.y))) +
+        +2.0 * float3_xyz(texture2D(in, uv + to_float2( 0.0,  d.y))) + 
+        +1.0 * float3_xyz(texture2D(in, uv + to_float2( d.x,  d.y)))
+        ) / 4.0;
+
+    float3 sst = to_float3(dot(u, u), dot(v, v), dot(u, v));
+    return sst;
+}
+
+__DEVICE__ float3 sst_gauss(float2 uv, __TEXTURE2D__ in, float sigma) 
+{
+    float3 dst = to_float3_s(0.0f);
+    float twoSigma2 = 2.0f * sigma * sigma;
+    int halfWidth = _ceil(sigma * 2.0f);
+
+    float3 sum = to_float3_s(0.0f);
+    float norm = 0.0f;
+    for ( int i = -halfWidth; i <= halfWidth; ++i ) {
+        for ( int j = -halfWidth; j <= halfWidth; ++j ) {
+            float d = length(to_float2(i,j));
+            float kernel = exp( -d *d / twoSigma2 );
+            float3 c = sst(uv + to_float2(i,j), in);
+            sum += kernel * c;
+            norm += kernel;
+        }
+    }
+
+    dst = (halfWidth != 0) ? sum / norm : sst(uv, in);
+    return dst;
+}
+
+__DEVICE__ float4 tfm (float3 g) 
+{
+    float lambda1 = 0.5f * (g.y + g.x +
+        sqrt(g.y*g.y - 2.0f*g.x*g.y + g.x*g.x + 4.0f*g.z*g.z));
+    float lambda2 = 0.5f * (g.y + g.x -
+        sqrt(g.y*g.y - 2.0f*g.x*g.y + g.x*g.x + 4.0f*g.z*g.z));
+
+    float2 v = to_float2(lambda1 - g.x, -g.z);
+    float2 t = to_float2_s(0.0f);
+    if (length(v) > 0.0) { 
+        t = normalize(v);
+    } else {
+        t = to_float2(0.0f, 1.0f);
+    }
+
+    float phi = atan2(t.y, t.x);
+    //float phi = _atan2f(t.y, t.x);
+
+    float A = (lambda1 + lambda2 > 0.0) ?
+        (lambda1 - lambda2) / (lambda1 + lambda2) : 0.0f;
+
+    float4 tfm = to_float4(t.x, t.y, phi, A);
+    return tfm;
+}
+
+__KERNEL__ void AkfKernel(__CONSTANTREF__ AkfParams *params, __TEXTURE2D__ src, __TEXTURE2D__ K0123, __TEXTURE2D_WRITE__ dst) 
+{
+    DEFINE_KERNEL_ITERATORS_XY(x, y);
+    int k0123Size = params->k0123Size;
+    float2 resolution = to_float2(params->width, params->height);
+    float2 uv = to_float2(x, y);
+    float sigma = params->sigma;
+    float alpha = params->alpha;
+    float radius = params->radius;
+    float q = params->q;
+
+    float4 m[8];
+    float3 s[8];
+    for (int k = 0; k < N; ++k) {
+        m[k] = to_float4_s(0.0f);
+        s[k] = to_float3_s(0.0f);
+    }
+
+    float4 t = tfm(
+        (sigma != 0) ?
+        sst_gauss(uv, src, sigma) : sst(uv, src)
+    );
+
+    float a = radius * clamp((alpha + t.w) / alpha, 0.1f, 2.0f); 
+    float b = radius * clamp(alpha / (alpha + t.w), 0.1f, 2.0f);
+
+    float cos_phi = cos(t.z);
+    float sin_phi = sin(t.z);
+
+    mat2 R = make_mat2(cos_phi, -sin_phi, sin_phi, cos_phi);
+    mat2 S = make_mat2(0.5f/a, 0.0f, 0.0f, 0.5f/b);
+    mat2 SR = S * R;
+
+    int max_x = int(
+        sqrt(
+            a*a * cos_phi*cos_phi +
+            b*b * sin_phi*sin_phi
+        )
+    );
+    int max_y = int(
+        sqrt(
+            a*a * sin_phi*sin_phi +
+            b*b * cos_phi*cos_phi
+        )
+    );
+
+    {
+        float3 c = float3_xyz(texture2D(src, uv));
+        float w = texture2D(K0123, to_float2_s(k0123Size * 0.5f)).x;
+        for (int k = 0; k < N; ++k) {
+            m[k] +=  _to_float4(c * w , w);
+            s[k] += c * c * w;
+        }
+    }
+
+    for (int j = 0; j <= max_y; ++j)  {
+        for (int i = -max_x; i <= max_x; ++i) {
+            float2 v = SR * to_float2(i,j);
+
+            float fact = (dot(v,v) <= 0.25 && ((j !=0) || (i > 0))) ? 1.0f : 0.0f;
+
+            float3 c0 = float3_xyz(texture2D(src, uv + to_float2(i,j)));
+            float3 c1 = float3_xyz(texture2D(src, uv - to_float2(i,j)));
+
+            float3 cc0 = c0 * c0;
+            float3 cc1 = c1 * c1;
+
+            float4 w0 = texture2D(K0123, k0123Size * (to_float2_s(0.5f) + v)) * fact;
+            float w0123[4] = {w0.x, w0.y, w0.z, w0.w};
+            for (int k = 0; k < 4; ++k) {
+                m[k] += _to_float4(c0 * w0123[k], w0123[k]);
+                s[k] += cc0 * w0123[k];
+            }
+            for (int k = 4; k < 8; ++k) {
+                m[k] += _to_float4(c1 * w0123[k-4], w0123[k-4]);
+                s[k] += cc1 * w0123[k-4];
+            }
+
+            float4 w4 = texture2D(K0123, k0123Size * (to_float2_s(0.5f) - v)) * fact;
+            float w4567[4] = {w4.x, w4.y, w4.z, w4.w};
+            for (int k = 4; k < 8; ++k) {
+                m[k] += _to_float4(c0 * w4567[k-4], w4567[k-4]);
+                s[k] += cc0 * w4567[k-4];
+            }
+            for (int k = 0; k < 4; ++k) {
+                m[k] += _to_float4(c1 * w4567[k], w4567[k]);
+                s[k] += cc1 * w4567[k];
+            }
+        }
+    }
+
+    float4 o = to_float4_s(0.0f);
+    for (int k = 0; k < N; ++k) {
+        m[k] = _to_float4(float3_xyz(m[k]) / m[k].w, m[k].w);
+        s[k] = absF(s[k] / m[k].w - float3_xyz(m[k]) * float3_xyz(m[k]));
+
+        float sigma2 = s[k].x + s[k].y + s[k].z;
+        float w = 1.0f / (1.0f + pow(255.0f * sigma2, 0.5f * q));
+
+        o += _to_float4(float3_xyz(m[k]) * w, w);
+    }
+
+    _tex2DVec4Write(dst, x, y, _to_float4(float3_xyz(o) / o.w, 1.0f));
+}
+]]
+
+--This is the control panel, all of the controls that we want to appear in our fuse should be created here.
+function Create()
+    Sigma = self:AddInput("Sigma", "Sigma", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.00,
+        INP_MaxScale = 10.00,
+        INP_Default = 2.00,
+    })
+    Alpha = self:AddInput("Alpha", "Alpha", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 1.00,
+        INP_MaxScale = 999.99,
+        INP_Default = 1.00,
+    })
+    Radius = self:AddInput("Radius", "Radius", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 1.00,
+        INP_MaxScale = 20.00,
+        INP_Default = 6.00,
+    })
+    Smoothing = self:AddInput("Smoothing", "Smoothing", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.01,
+        INP_MaxScale = 100.00,
+        INP_Default = 25.00,
+    })
+    q = self:AddInput("q", "q", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 1.00,
+        INP_MaxScale = 16.00,
+        INP_Default = 8.00,
+    })
+    InImage = self:AddInput("Image", "Image", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+        INP_AcceptsGPUImages = true,
+    })
+    OutImage = self:AddOutput("Output", "Output", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+    -- OutKrnl = self:AddOutput("Output", "Krnl", {
+    --     LINKID_DataType = "Image",
+    --     LINK_Main = 2,
+    -- })
+end
+
+local lastreqtime = -2
+---@type integer
+local const N = 8
+---@type float
+local const InvN = 0.125
+---@type int
+local const Krnl_size = 32
+print("AKF: Initializing K0123 texture...")
+---@type Image
+local k0123 = Image { IMG_Like = blank, IMG_Depth = 8, IMG_Width = Krnl_size, IMG_Height = Krnl_size }
+print("AKF: K0123 texture initialized.")
+
+---@param krnl_size uint The size of the kernel.
+---@param sigma_r float Kernel sigma value.
+---@param smoothing float Degree of sigma value smoothing (0.0~1.0).
+---@return Image K0123 Kernel texture.
+function GenK0123Tex(krnl_size --[[@as uint]], sigma_r --[[@as float]], smoothing --[[@as float]])
+    krnl_size = math.abs(krnl_size)
+    if (krnl_size ~= k0123.Width) or (krnl_size ~= k0123.Height) then
+        -- print("AKF:GenK0123Tex:Preraiding texture...")
+        k0123 = Image { IMG_Like = blank, IMG_Depth = 8, IMG_Width = krnl_size, IMG_Height = krnl_size }
+        -- print("AKF:GenK0123Tex:Preraiding texture...done")
+    else
+        k0123 = Image { IMG_Like = k0123 }
+        -- k0123:Clear()
+    end
+
+    -- print("AKF:GenK0123Tex:Start generating texture...")
+    -- print("AKF:GenK0123Tex:Krnl preprocessing...")
+    k0123:MultiProcessPixels(nil, {InvN=InvN ,Krnl_size=krnl_size}, 0, 0, krnl_size, krnl_size, k0123,
+        function(x, y, p)
+            ---@type table
+            local c = {0.0, 0.0, 0.0, 0.0}
+
+            -- Calculated for each channel
+            for k, v in pairs(c) do
+                ---@type double
+                local xi = x - 0.5 * Krnl_size + 0.5
+                ---@type double
+                local yi = y - 0.5 * Krnl_size + 0.5
+                ---@type double
+                local r = math.sqrt(xi*xi + yi*yi)
+
+                ---@diagnostic disable-next-line: deprecated
+                local a = 0.5 * math.atan2(yi, xi) / math.pi + k * 1.0 * InvN
+                if (a > 0.5) then
+                    a = a + 1.0
+                elseif (a < -0.5) then
+                    a = a - 1.0
+                end
+
+                if ((math.abs(a) <= 0.5*InvN) and (r < 0.5*Krnl_size)) then
+                    v = 1.0
+                else
+                    v = 0.0
+                end
+                -- v = v + 1.0
+                c[k] = v
+            end
+            p = Pixel({R=c[1], G=c[2], B=c[3], A=c[4]})
+            return p
+        end
+    )
+
+    -- for x = 0, krnl_size - 1 do
+    --     for y = 0, krnl_size - 1 do
+    --         ---@type table
+    --         local c = {0.0, 0.0, 0.0, 0.0}
+
+    --         -- Calculated for each channel
+    --         for k, v in pairs(c) do
+    --             ---@type double
+    --             local xi = x - 0.5 * krnl_size + 0.5
+    --             ---@type double
+    --             local yi = y - 0.5 * krnl_size + 0.5
+    --             ---@type double
+    --             local r = math.sqrt(xi*xi + yi*yi)
+
+    --             ---@diagnostic disable-next-line: deprecated
+    --             local a = 0.5 * math.atan2(yi, xi) / math.pi + k * 1.0 * InvN
+    --             if (a > 0.5) then
+    --                 a = a + 1.0
+    --             elseif (a < -0.5) then
+    --                 a = a - 1.0
+    --             end
+
+    --             if ((math.abs(a) <= 0.5*InvN) and (r < 0.5*krnl_size)) then
+    --                 v = 1.0
+    --             else
+    --                 v = 0.0
+    --             end
+    --             -- v = v + 1.0
+    --             c[k] = v
+    --         end
+    --         local p = Pixel({R=c[1], G=c[2], B=c[3], A=c[4]})
+    --         k0123:SetPixel(x, y, p)
+    --     end
+    -- end
+
+    -- print("AKF:GenK0123Tex:Krnl preprocessing...done")
+
+    -- print("AKF:GenK0123Tex:Blur filtering...")
+    k0123:Blur(k0123, {BLUR_Type="Gaussian", BLUR_XSize=smoothing, BLUR_YSize=smoothing})
+    -- print("AKF:GenK0123Tex:Blur filtering...done")
+
+    -- print("AKF:GenK0123Tex:Krnl sub processing...")
+    local mx = 0.0
+    for x=0, krnl_size-1 do
+        for y=0, krnl_size-1 do
+            ---@type Pixel
+            local p = Pixel()
+            k0123:GetPixel(x, y, p)
+            ---@type table
+            local c = {p.R, p.G, p.B, p.A}
+
+            for k, v in pairs(c) do
+                ---@type double
+                local xi = x - 0.5 * krnl_size + 0.5
+                ---@type double
+                local yi = y - 0.5 * krnl_size + 0.5
+                ---@type double
+                local r = math.sqrt(xi*xi + yi*yi)
+                v = v * math.exp(-0.5 * r * r / sigma_r / sigma_r)
+                if (v > mx) then
+                    mx = v
+                end
+                -- v = v + 1.0
+                c[k] = v
+            end
+            p = Pixel({R=c[1], G=c[2], B=c[3], A=c[4]})
+            k0123:SetPixel(x, y, p)
+        end
+    end
+    -- -- print("AKF:GenK0123Tex:Krnl sub processing...done")
+
+    -- -- print("AKF:GenK0123Tex:Krnl multi process postprocessing...")
+    k0123:MultiProcessPixels(nil, {MX = mx}, 0, 0, krnl_size, krnl_size, k0123,
+        function(x, y, p)
+            p.R = p.R / MX
+            p.G = p.G / MX
+            p.B = p.B / MX
+            p.A = p.A / MX
+            return p
+        end
+    )
+    -- print("AKF:GenK0123Tex:Krnl multi process postprocessing...done")
+    -- for x=0, krnl_size-1 do
+    --     for y=0, krnl_size-1 do
+    --         local p = Pixel()
+    --         k0123:GetPixel(x, y, p)
+    --         p.R = p.R / mx
+    --         p.G = p.G / mx
+    --         p.B = p.B / mx
+    --         p.A = p.A / mx
+    --         k0123:SetPixel(x, y, p)
+    --     end
+    -- end
+    -- print("AKF:GenK0123Tex:Start generating texture...done")
+    return k0123
+end
+
+function Process(req)
+    -- print("AFK:Process:Start processing...")
+    local src = InImage:GetValue(req)
+    local dst = Image { IMG_Like = src, IMG_DeferAlloc = true }
+
+    -- Generate the K0123 texture
+    local sigma = 0.25 * (Krnl_size - 1)
+    local smoothing = 0.01 * Smoothing:GetValue(req).Value
+    print("AKF:Process:Start generating K0123 texture")
+    local t = os.clock()
+    k0123 = GenK0123Tex(Krnl_size, sigma, smoothing)
+    print("AKF:Process:Start generating K0123 texture...done (" .. os.clock() - t .. "s)")
+
+    -- This calls on kernel to process for akf
+    local akfNode = DVIPComputeNode(req, "AkfKernel", AkfKernel, "AkfParams", AkfParams)
+
+    if (lastreqtime ~= req.Time - 1) then
+        params = akfNode:GetParamBlock(AkfParams)
+    end
+    lastreqtime = req.Time
+
+    --This gets the values of our sliders from the control panel.
+    params.k0123Size = Krnl_size
+    params.sigma = Sigma:GetValue(req).Value
+    params.alpha = Alpha:GetValue(req).Value
+    params.radius = Radius:GetValue(req).Value
+    params.q = q:GetValue(req).Value
+    params.srcCompOrder = src:IsMask() and 1 or 15
+    params.width  = src.DataWindow:Width()
+    params.height = src.DataWindow:Height()
+
+    akfNode:SetParamBlock(params)
+    --This gets the value of our input image for us to modify inside the kernel
+    akfNode:AddInput("src", src)
+    akfNode:AddInput("K0123", k0123)
+    --This takes the image that we modified in the kernel and sends it to the output.
+    akfNode:AddOutput("dst", dst)
+
+    local successAkf = akfNode:RunSession(req)
+
+    if not successAkf then
+        dst = nil
+        dump(akfNode:GetErrorLog()) -- Error output of the DCTL
+    end
+
+    OutImage:Set(req, dst)
+end

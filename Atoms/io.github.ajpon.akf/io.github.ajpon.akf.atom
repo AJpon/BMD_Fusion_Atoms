@@ -1,0 +1,48 @@
+Atom {
+	Name = "Anisotropic Kuwahara Filter",
+	Category = "Tools/Filter",
+	Author = "pon",
+	Version = 0.1,
+	Date = {2022, 8, 18},
+	Minimum = 15,
+	Description = [[<center><h2>Anisotropic Kuwahara Filter (AKF)</h2></center>
+
+The anisotropic Kuwahara filter is a generalization of the Kuwahara filter that avoids artifacts by adapting shape, scale and orientation of the filter to the local structure of the input. Due to this adaption, directional image features are better preserved and emphasized.<br> This results in overall sharper edges and a more feature-abiding painterly effect.
+
+<h3><font color="yellow">Attention</font></h3>
+The current version does not guarantee even minimal operation.<br>
+It has only been tested on the Windows version of DaFusion where CUDA is available; it will not work with OpenCL.<br>
+Additionally, there is a possibility of unknown problems even in a CUDA environment.<br>
+Also note that it is not fully optimized and is very slow.
+
+<h3>How to use</h3>
+wip
+
+<h3>Acknowledgements</h3>
+The original program was written by <a href="www.kyprianidis.com">Eric Kyprianidis</a>.<br>
+(Copyright &copy; 2009-2011 <a href="www.hpi3d.de">Computer Graphics Systems Group</a> at the
+Hasso-Plattner-Institut, Potsdam, Germany)<br>
+This program is based on the following paper and the source code released under GNU GPL v3.<br><br>
+
+<strong>Anisotropic Kuwahara Filtering on the GPU (Paper)</strong>
+<ul>
+	<li>https://www.kyprianidis.com/p/gpupro/</li>
+	<li>https://www.taylorfrancis.com/chapters/edit/10.1201/b10648-22/anisotropic-kuwahara-filtering-gpu</li>
+</ul>
+<strong>Original source code</strong>
+<ul>
+	<li>https://code.google.com/archive/p/gpuakf/</li>
+	<li>https://code.google.com/archive/p/polyakf/</li>
+</ul><br>
+
+Special thanks to all those who conceived and implemented this filter.
+]],
+	Donation = {
+		URL = [[https://paypal.me/ajipon]],
+		Amount = "$3.00",
+	},
+
+	Deploy = {
+		"Fuses/Filter/akf.fuse",
+	},
+}
