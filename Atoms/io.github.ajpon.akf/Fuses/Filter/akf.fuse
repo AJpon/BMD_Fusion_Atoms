@@ -11,7 +11,7 @@
      - https://code.google.com/archive/p/gpuakf/
      - https://code.google.com/archive/p/polyakf/
 
-    Version 0.10
+    Version 0.1.1
 ]]
 
 ---@alias float number
@@ -25,13 +25,6 @@ FuRegisterClass("AnisotropicKuwahara", CT_Tool, {
     REGS_OpIconString = "AKF",
     REGS_OpDescription = "",
     REG_Version = 011,
-
-    REG_Source_GlobalCtrls = true,
-	REG_Source_SizeCtrls = true,
-	REG_Source_AspectCtrls = true,
-	REG_Source_DepthCtrls = true,
-	
-	REG_TimeVariant = true,
 })
 
 --These are the parameters that we need access to in our kernel.
