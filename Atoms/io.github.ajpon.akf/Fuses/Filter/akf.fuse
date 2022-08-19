@@ -123,17 +123,22 @@ __DEVICE__ float3 sst_gauss(float2 uv, __TEXTURE2D__ in, float sigma)
 
     float3 sum = to_float3_s(0.0f);
     float norm = 0.0f;
-    for ( int i = -halfWidth; i <= halfWidth; ++i ) {
-        for ( int j = -halfWidth; j <= halfWidth; ++j ) {
-            float d = length(to_float2(i,j));
-            float kernelX = _expf( -d *d / twoSigma2 );
-            float3 c = sst(uv + to_float2(i,j), in);
-            sum += kernelX * c;
-            norm += kernelX;
+    if (halfWidth > 0) {
+        for ( int i = -halfWidth; i <= halfWidth; ++i ) {
+            for ( int j = -halfWidth; j <= halfWidth; ++j ) {
+                float d = length(to_float2(i,j));
+                float kernelX = _expf( -d *d / twoSigma2 );
+                float3 c = sst(uv + to_float2(i,j), in);
+                sum += kernelX * c;
+                norm += kernelX;
+            }
         }
+    } else {
+        sum = sst(uv, in);
+        norm = 1.0f;
     }
 
-    dst = (halfWidth != 0) ? sum / norm : sst(uv, in);
+    dst = sum / norm;
     return dst;
 }
 
@@ -145,7 +150,12 @@ __DEVICE__ float4 tfm (float3 g)
         _sqrtf(g.y*g.y - 2.0f*g.x*g.y + g.x*g.x + 4.0f*g.z*g.z));
 
     float2 v = to_float2(lambda1 - g.x, -g.z);
-    float2 t = (length(v) > 0.0) ? normalize(v) : to_float2(0.0f, 1.0f);
+    float2 t = to_float2_s(0.0f);
+    if (length(v) > 0.0) {
+        t = normalize(v);
+    } else {
+        t = to_float2(0.0f, 1.0f);
+    }
 
     float phi = atan2(t.y, t.x);
 
@@ -213,36 +223,38 @@ __KERNEL__ void AkfKernel(__CONSTANTREF__ AkfParams *params, __TEXTURE2D__ src, 
 
     for (int j = 0; j <= max_y; ++j)  {
         for (int i = -max_x; i <= max_x; ++i) {
-            float2 v = mulMF(SR,to_float2(i,j));
+            if ((j !=0) || (i > 0)) {
+                float2 v = mulMF(SR,to_float2(i,j));
 
-            float fact = (dot(v,v) <= 0.25 && ((j !=0) || (i > 0))) ? 1.0f : 0.0f;
+                if (dot(v,v) <= 0.25) {
+                    float3 c0 = float3_xyz(texture2D(src, uv + to_float2(i,j)));
+                    float3 c1 = float3_xyz(texture2D(src, uv - to_float2(i,j)));
 
-            float3 c0 = float3_xyz(texture2D(src, uv + to_float2(i,j)));
-            float3 c1 = float3_xyz(texture2D(src, uv - to_float2(i,j)));
+                    float3 cc0 = c0 * c0;
+                    float3 cc1 = c1 * c1;
 
-            float3 cc0 = c0 * c0;
-            float3 cc1 = c1 * c1;
+                    float4 w0 = texture2D(K0123, k0123Size * (to_float2_s(0.5f) + v));
+                    float w0123[4] = {w0.x, w0.y, w0.z, w0.w};
+                    for (int k = 0; k < 4; ++k) {
+                        m[k] += to_float4_aw(c0 * w0123[k], w0123[k]);
+                        s[k] += cc0 * w0123[k];
+                    }
+                    for (int k = 4; k < 8; ++k) {
+                        m[k] += to_float4_aw(c1 * w0123[k-4], w0123[k-4]);
+                        s[k] += cc1 * w0123[k-4];
+                    }
 
-            float4 w0 = texture2D(K0123, k0123Size * (to_float2_s(0.5f) + v)) * fact;
-            float w0123[4] = {w0.x, w0.y, w0.z, w0.w};
-            for (int k = 0; k < 4; ++k) {
-                m[k] += to_float4_aw(c0 * w0123[k], w0123[k]);
-                s[k] += cc0 * w0123[k];
-            }
-            for (int k = 4; k < 8; ++k) {
-                m[k] += to_float4_aw(c1 * w0123[k-4], w0123[k-4]);
-                s[k] += cc1 * w0123[k-4];
-            }
-
-            float4 w4 = texture2D(K0123, k0123Size * (to_float2_s(0.5f) - v)) * fact;
-            float w4567[4] = {w4.x, w4.y, w4.z, w4.w};
-            for (int k = 4; k < 8; ++k) {
-                m[k] += to_float4_aw(c0 * w4567[k-4], w4567[k-4]);
-                s[k] += cc0 * w4567[k-4];
-            }
-            for (int k = 0; k < 4; ++k) {
-                m[k] += to_float4_aw(c1 * w4567[k], w4567[k]);
-                s[k] += cc1 * w4567[k];
+                    float4 w4 = texture2D(K0123, k0123Size * (to_float2_s(0.5f) - v));
+                    float w4567[4] = {w4.x, w4.y, w4.z, w4.w};
+                    for (int k = 4; k < 8; ++k) {
+                        m[k] += to_float4_aw(c0 * w4567[k-4], w4567[k-4]);
+                        s[k] += cc0 * w4567[k-4];
+                    }
+                    for (int k = 0; k < 4; ++k) {
+                        m[k] += to_float4_aw(c1 * w4567[k], w4567[k]);
+                        s[k] += cc1 * w4567[k];
+                    }
+                }
             }
         }
     }
